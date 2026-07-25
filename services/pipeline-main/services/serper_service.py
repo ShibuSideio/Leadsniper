@@ -72,6 +72,13 @@ _ENRICHMENT_SOCIAL_BLACKLIST = [
     # Classifieds / directories / reviews — not B2B leads
     "yelp.com", "yellowpages.com", "bbb.org", "trustpilot.com",
     "glassdoor.com", "indeed.com", "monster.com",
+    # V27.7: News aggregators / search portals (Serper log waste)
+    "news.google.com", "google.com", "google.co.in", "google.co.uk",
+    "news.yahoo.com", "msn.com", "bing.com", "duckduckgo.com",
+    "flipboard.com", "feedly.com",
+    # V27.7: Directories / education portals (enriching portal ≠ lead company)
+    "justdial.com", "sulekha.com", "indiaeducation.net", "indiamike.com",
+    "collegedunia.com", "yocket.com", "shiksha.com",
     # V24.5.1: B2B networking / SaaS platform root domains.
     # These are search CONTAINERS — individual posts and profiles found
     # within them are valid leads and flow through the snippet path
@@ -1068,10 +1075,11 @@ def deep_context_serper_dork(
 ) -> tuple[str, bool]:
     """Fetch contextual enrichment signals for a domain via Serper.
 
-    V24.1.2: B2B domains receive Places + company profile + hiring queries
-    (3 credits). Consumer vectors (B2C/B2B2C/D2C) receive Places + review/
-    complaint queries (2 credits). Social domains and non-business suffixes
-    (.edu, .gov, .org) are gated and receive no enrichment.
+    V27.7: B2B domains receive Places + hiring only (2 credits). Company-profile
+    search was removed — low SNR and duplicated mesh/social paths. Consumer
+    vectors still get Places + reviews (2 credits). 48h Firestore cache prevents
+    double-dispatch waste (same domain, multiple leads). Social/aggregator/
+    directory hosts are gated (incl. news.google.com).
 
     Args:
         domain:          Root domain string.
@@ -1084,7 +1092,6 @@ def deep_context_serper_dork(
         ``("", False)`` if gatekeeper blocks enrichment.
     """
     from core.clients import get_db  # type: ignore[import]
-    from google.cloud import firestore  # type: ignore[import]
 
     if not domain:
         return "", False
@@ -1100,9 +1107,25 @@ def deep_context_serper_dork(
     # Social domains and B2C vectors bypass enrichment since they don't contain B2B lead info.
     cleaned = domain.lower().replace("www.", "")
     for blocked in _ENRICHMENT_SOCIAL_BLACKLIST:
-        if blocked in cleaned:
+        if cleaned == blocked or cleaned.endswith("." + blocked) or blocked in cleaned:
             log.info("enrichment_gated_social", domain=domain)
             return "", False
+
+    # V27.7 shared SSOT (news.google, directories, etc.)
+    try:
+        from shared.serper_enrichment_policy import (  # type: ignore[import]
+            is_enrichment_skip_domain,
+            read_enrichment_cache,
+            write_enrichment_cache,
+        )
+        if is_enrichment_skip_domain(cleaned):
+            log.info("enrichment_gated_policy_skip", domain=domain)
+            return "", False
+    except Exception as _pol_err:
+        log.warning("enrichment_policy_import_error", error=str(_pol_err))
+        is_enrichment_skip_domain = None  # type: ignore[assignment]
+        read_enrichment_cache = None  # type: ignore[assignment]
+        write_enrichment_cache = None  # type: ignore[assignment]
 
     # V24.1.1: Forum prefix detection — "forum.example.com", "talk.site.com", etc.
     if any(cleaned.startswith(p) for p in _FORUM_PREFIXES):
@@ -1121,8 +1144,25 @@ def deep_context_serper_dork(
         log.info("enrichment_gated_non_business_suffix", domain=domain)
         return "", False
 
-    # V27.3.0: residual Serper budget (deep_context is outside produce QueryBrain)
-    _n_calls = 2 if _is_consumer_archetype(sourcing_vector) else 3
+    _is_consumer = _is_consumer_archetype(sourcing_vector)
+    _cache_kind = "deep_context_consumer" if _is_consumer else "deep_context_b2b"
+
+    # V27.7: 48h domain cache — zero Serper on repeat dispatch for same host
+    if read_enrichment_cache is not None:
+        try:
+            cached = read_enrichment_cache(
+                get_db(),
+                cleaned,
+                _cache_kind,
+                log=lambda msg, **kw: log.info(msg, **kw),
+            )
+            if cached is not None and "context_str" in cached:
+                return str(cached.get("context_str") or ""), bool(cached.get("hiring_intent"))
+        except Exception as _ce:
+            log.warning("deep_context_cache_read_failed", error=str(_ce))
+
+    # V27.7: B2B and consumer both 2 residual credits (profile query removed)
+    _n_calls = 2
     try:
         from shared.serper_budget import record_serper_spend  # type: ignore[import]
         from core.clients import get_db as _gdb  # type: ignore[import]
@@ -1146,7 +1186,7 @@ def deep_context_serper_dork(
     context_data: list[str] = []
 
     # BUG-S1 FIX: Previously 3 sequential Serper calls with timeout=15 each = 45s max.
-    # Fix: Run all 3 calls in parallel via ThreadPoolExecutor. Max wall time ~15s.
+    # Fix: Run all calls in parallel via ThreadPoolExecutor. Max wall time ~15s.
     # BUG-S2 FIX: Usage metrics Firestore write was inside _fetch() per call = 3 RPCs.
     # Fix: Single batched write at the end (1 RPC total).
     def _fetch_parallel(serper_url: str, body: dict) -> dict:
@@ -1162,8 +1202,6 @@ def deep_context_serper_dork(
     # V24.1.1 FIX (W3): Consumer vectors get lightweight enrichment instead of
     # being blanket-blocked. B2C leads now receive GMB + review context instead of
     # zero context, reducing the scoring bias against consumer leads.
-    _is_consumer = _is_consumer_archetype(sourcing_vector)
-
     tasks = []
     if _is_consumer:
         # Consumer enrichment: GMB (local presence) + review signals (consumer sentiment)
@@ -1174,19 +1212,16 @@ def deep_context_serper_dork(
         }))
         log.info("enrichment_consumer_path", domain=domain, vector=sourcing_vector)
     else:
-        # B2B enrichment: Places + company profile + hiring intent (3 queries)
-        # NOTE: Non-business suffixes (.edu, .gov, .org) already returned early
-        # above, so Places is always relevant here.
+        # V27.7 B2B: Places + hiring only (2 credits). Dropped low-SNR
+        # "company profile OR social media" query; mesh handles funding/reviews.
         tasks.append(("https://google.serper.dev/places",  {"q": domain, "num": 3}))
-        tasks.extend([
-            ("https://google.serper.dev/search",  {"q": f'company profile OR social media "{domain}"', "num": 3}),
-            ("https://google.serper.dev/search",  {
-                "q": f'job openings OR careers "{domain}"',
-                "num": 3,
-            }),
-        ])
+        tasks.append(("https://google.serper.dev/search",  {
+            "q": f'job openings OR careers "{domain}"',
+            "num": 3,
+        }))
+        log.info("enrichment_b2b_path_v27_7", domain=domain, calls=2)
 
-    with _cf.ThreadPoolExecutor(max_workers=3) as pool:
+    with _cf.ThreadPoolExecutor(max_workers=2) as pool:
         futures = [pool.submit(_fetch_parallel, url, body) for url, body in tasks]
         results = []
         for fut in futures:
@@ -1212,13 +1247,8 @@ def deep_context_serper_dork(
         for org in review_data.get("organic", []):
             context_data.append(f"[REVIEW] {org.get('snippet', '')}")
     else:
-        # B2B path: results[1] = social, results[2] = hiring
-        social_data = results[1] if len(results) > 1 else {}
-        hiring_data = results[2] if len(results) > 2 else {}
-
-        for org in social_data.get("organic", []):
-            context_data.append(f"[SOCIAL] {org.get('snippet', '')}")
-
+        # V27.7 B2B path: results[1] = hiring only
+        hiring_data = results[1] if len(results) > 1 else {}
         hiring_sigs = [
             "we are hiring", "job description", "apply today",
             "openings", "careers", "looking for", "lakh", "lpa", "fresher",
@@ -1239,4 +1269,17 @@ def deep_context_serper_dork(
         pass
 
     context_str = " | ".join(context_data)[:3000]
+
+    if write_enrichment_cache is not None:
+        try:
+            write_enrichment_cache(
+                get_db(),
+                cleaned,
+                _cache_kind,
+                {"context_str": context_str, "hiring_intent": hiring_intent},
+                log=lambda msg, **kw: log.info(msg, **kw),
+            )
+        except Exception as _cw:
+            log.warning("deep_context_cache_write_failed", error=str(_cw))
+
     return context_str, hiring_intent

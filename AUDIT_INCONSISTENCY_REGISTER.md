@@ -204,8 +204,8 @@ Always-on or dispatch-path Serper with **no** `allow_serper` / `BudgetGuard`:
 |------|-------------------|
 | Produce QueryBrain `search_serper` | N queries / cycle |
 | Produce harvest SerperDiscovery / Reviews / Reddit (when allow_serper) | multi |
-| Dispatch `deep_context` | 2–3 / lead |
-| Intelligence mesh | ≤4 / lead |
+| Dispatch `deep_context` | 2 / lead (V27.7: places+hiring B2B; places+reviews B2C; 48h cache) |
+| Intelligence mesh | ≤2 / lead (V27.7: funding+reviews; hiring/news off by default; 48h domain cache) |
 | PRISM WalledGarden | ≤3 |
 | Inbound organic | ≤6 after V27.1 (build cap) |
 | Inbound maps + reviews | ≤3 × ≤5 places × 2 |

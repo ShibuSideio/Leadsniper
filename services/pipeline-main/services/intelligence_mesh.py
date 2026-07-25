@@ -1,5 +1,5 @@
 """
-pipeline-main — Intelligence Mesh (V24.0)
+pipeline-main — Intelligence Mesh (V24.0 / V27.7)
 
 Pluggable multi-source enrichment engine. Each IntelligenceProvider
 searches a specific data source for signals about a company/domain.
@@ -7,6 +7,13 @@ All providers use Serper as the underlying search engine (no new API keys).
 
 Providers run in parallel with a 3-second total timeout.
 Failing providers are silently skipped — lead is saved regardless.
+
+V27.7 waste controls:
+  - Default providers: Funding + Reviews only (2 credits).
+    Hiring/news removed — deep_context covers hiring; news SNR is low.
+  - Shared skip list (news.google, directories, social hosts).
+  - 48h domain cache (Firestore) for mesh results.
+  - Callers should pass residual=True on serper_fn (dispatch wraps it).
 """
 from __future__ import annotations
 
@@ -27,13 +34,13 @@ class IntelligenceProvider(ABC):
     def fetch_signals(self, company_name: str, domain: str,
                       serper_fn, **kwargs) -> list[dict]:
         """Fetch signal entries for a given company.
-        
+
         Args:
             company_name: Company name (may be None).
             domain: Root domain.
             serper_fn: Callable that executes a Serper search.
                        Signature: serper_fn(query, location=None, gl=None) -> list[dict]
-        
+
         Returns:
             List of signal dicts: {signal_type, source, evidence_text, confidence}
         """
@@ -41,7 +48,11 @@ class IntelligenceProvider(ABC):
 
 
 class HiringSignalProvider(IntelligenceProvider):
-    """Detect hiring activity via careers page dorks."""
+    """Detect hiring activity via careers page dorks.
+
+    V27.7: Not in default registry — deep_context already runs hiring.
+    Kept for optional explicit opt-in via include_providers.
+    """
     name = "hiring"
 
     def fetch_signals(self, company_name, domain, serper_fn, **kwargs):
@@ -120,12 +131,14 @@ class FundingSignalProvider(IntelligenceProvider):
 
 
 class NewsSignalProvider(IntelligenceProvider):
-    """Monitor recent news mentions."""
+    """Monitor recent news mentions.
+
+    V27.7: Not in default registry — low SNR, high credit cost.
+    """
     name = "news"
 
     def fetch_signals(self, company_name, domain, serper_fn, **kwargs):
         signals = []
-        # SCORE-05/06: Fall back to domain when company_name is missing.
         search_term = company_name or domain
         if not search_term:
             return signals
@@ -145,13 +158,19 @@ class NewsSignalProvider(IntelligenceProvider):
         return signals
 
 
-# Registry of all active providers
+# V27.7: Default = Funding + Reviews only (2 credits max).
+# Hiring covered by deep_context; news dropped for SNR.
 _PROVIDERS: list[IntelligenceProvider] = [
-    HiringSignalProvider(),
     ReviewSignalProvider(),
     FundingSignalProvider(),
-    NewsSignalProvider(),
 ]
+
+_ALL_PROVIDERS: dict[str, IntelligenceProvider] = {
+    "hiring": HiringSignalProvider(),
+    "reviews": ReviewSignalProvider(),
+    "funding": FundingSignalProvider(),
+    "news": NewsSignalProvider(),
+}
 
 
 def enrich_signals(
@@ -159,8 +178,14 @@ def enrich_signals(
     domain: str,
     serper_fn,
     timeout_s: float = 3.0,
+    *,
+    include_providers: Optional[list[str]] = None,
+    skip_cache: bool = False,
 ) -> list[dict]:
-    """Run all intelligence providers in parallel. Non-blocking.
+    """Run intelligence providers in parallel. Non-blocking.
+
+    V27.7 default: reviews + funding only (2 Serper calls). Pass
+    include_providers=["hiring","reviews","funding","news"] to restore full pack.
 
     Returns combined list of signal dicts from all providers.
     Individual provider failures are logged with a warning.
@@ -171,45 +196,81 @@ def enrich_signals(
         ``getattr(result, 'enrichment_failed', False)``
     """
     # F4 (V25.6.1): Guard against non-domain strings ("N/A", empty, localhost).
-    # These produce 4 wasted Serper queries each.
     if not domain or domain.lower() in ("n/a", "none", "null", "localhost", "unknown"):
         log.info("mesh_skip_non_domain", domain=domain,
-                 note="Non-domain string blocked — saves 4 Serper credits.")
+                 note="Non-domain string blocked — saves Serper credits.")
         return []
 
-    # F1 (V25.6.1): Guard against social/shared platform domains.
-    # Enriching quora.com's own funding/hiring/G2 reviews is meaningless —
-    # the lead is a *post on* quora.com, not quora.com the company.
-    _MESH_SKIP_DOMAINS = frozenset({
-        # Social platforms
-        "reddit.com", "facebook.com", "instagram.com", "youtube.com",
-        "linkedin.com", "quora.com", "twitter.com", "x.com", "medium.com",
-        "tiktok.com", "pinterest.com", "tumblr.com", "snapchat.com",
-        # Community / forums
-        "stackexchange.com", "stackoverflow.com", "news.ycombinator.com",
-        "community.hubspot.com", "community.g2.com", "indiehackers.com",
-        # Classifieds / directories
-        "yelp.com", "yellowpages.com", "trustpilot.com", "glassdoor.com",
-        "indeed.com", "craigslist.org", "gumtree.com",
-        # Wiki / education
-        "wikipedia.org", "fandom.com", "archive.org",
-    })
-    _cleaned = domain.lower().replace("www.", "")
-    if any(_cleaned.endswith(s) for s in _MESH_SKIP_DOMAINS):
-        log.info("mesh_skip_social_domain", domain=domain,
-                 note="Social/shared platform domain blocked — saves 4 Serper credits.")
-        return []
+    # V27.7: shared skip policy (social, news aggregators, directories)
+    try:
+        from shared.serper_enrichment_policy import (  # type: ignore[import]
+            is_enrichment_skip_domain,
+            read_enrichment_cache,
+            write_enrichment_cache,
+        )
+        if is_enrichment_skip_domain(domain):
+            log.info(
+                "mesh_skip_policy_domain",
+                domain=domain,
+                note="Aggregator/social/directory blocked — saves mesh credits.",
+            )
+            return []
+    except Exception as _pol_err:
+        log.warning("mesh_policy_import_error", error=str(_pol_err))
+        # Fallback local list if shared package unavailable
+        _MESH_SKIP_DOMAINS = frozenset({
+            "reddit.com", "facebook.com", "instagram.com", "youtube.com",
+            "linkedin.com", "quora.com", "twitter.com", "x.com", "medium.com",
+            "tiktok.com", "pinterest.com", "tumblr.com", "snapchat.com",
+            "stackexchange.com", "stackoverflow.com", "news.ycombinator.com",
+            "community.hubspot.com", "community.g2.com", "indiehackers.com",
+            "yelp.com", "yellowpages.com", "trustpilot.com", "glassdoor.com",
+            "indeed.com", "craigslist.org", "gumtree.com",
+            "wikipedia.org", "fandom.com", "archive.org",
+            "news.google.com", "google.com", "justdial.com", "sulekha.com",
+        })
+        _cleaned = domain.lower().replace("www.", "")
+        if any(_cleaned == s or _cleaned.endswith("." + s) for s in _MESH_SKIP_DOMAINS):
+            log.info("mesh_skip_social_domain", domain=domain)
+            return []
+        read_enrichment_cache = None  # type: ignore[assignment]
+        write_enrichment_cache = None  # type: ignore[assignment]
+
+    # V27.7 cache
+    if not skip_cache and read_enrichment_cache is not None:
+        try:
+            from core.clients import get_db  # type: ignore[import]
+            cached = read_enrichment_cache(
+                get_db(),
+                domain,
+                "mesh_v27_7",
+                log=lambda msg, **kw: log.info(msg, **kw),
+            )
+            if cached is not None and isinstance(cached.get("signals"), list):
+                return list(cached["signals"])
+        except Exception as _ce:
+            log.warning("mesh_cache_read_failed", error=str(_ce))
+
+    if include_providers:
+        providers = [
+            _ALL_PROVIDERS[n]
+            for n in include_providers
+            if n in _ALL_PROVIDERS
+        ]
+        if not providers:
+            providers = list(_PROVIDERS)
+    else:
+        providers = list(_PROVIDERS)
 
     all_signals: list[dict] = []
     _provider_failure_count = 0
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(_PROVIDERS)) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(providers))) as pool:
         future_map = {
             pool.submit(p.fetch_signals, company_name, domain, serper_fn): p.name
-            for p in _PROVIDERS
+            for p in providers
         }
         done, not_done = concurrent.futures.wait(future_map, timeout=timeout_s)
-        # Count timed-out providers as failures
         _provider_failure_count += len(not_done)
         for fut in done:
             provider_name = future_map[fut]
@@ -225,17 +286,31 @@ def enrich_signals(
                 log.warning("mesh_provider_failed: provider=%s err=%s", provider_name, exc)
 
     # P2-SIL-3: Flag total enrichment failure so dispatch can log/handle it.
-    if _provider_failure_count >= len(_PROVIDERS):
+    if _provider_failure_count >= len(providers):
         log.warning(
             "mesh_all_providers_failed",
             company_name=company_name,
             domain=domain,
-            provider_count=len(_PROVIDERS),
+            provider_count=len(providers),
             note="All intelligence mesh providers returned zero signals or errored.",
         )
-        # Attach flag as list attribute — callers use getattr(result, 'enrichment_failed', False)
         all_signals = _EnrichmentResult(all_signals)
         all_signals.enrichment_failed = True  # type: ignore[attr-defined]
+
+    if not skip_cache and write_enrichment_cache is not None and all_signals:
+        try:
+            from core.clients import get_db  # type: ignore[import]
+            # Store plain list (not _EnrichmentResult) for JSON-safe cache
+            plain = [dict(s) if isinstance(s, dict) else s for s in all_signals]
+            write_enrichment_cache(
+                get_db(),
+                domain,
+                "mesh_v27_7",
+                {"signals": plain},
+                log=lambda msg, **kw: log.info(msg, **kw),
+            )
+        except Exception as _cw:
+            log.warning("mesh_cache_write_failed", error=str(_cw))
 
     return all_signals
 

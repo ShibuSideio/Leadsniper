@@ -1815,16 +1815,29 @@ def dispatch():
                 prism_mode=prism_mode,
             )
 
-            # V24.0: Intelligence Mesh enrichment (non-blocking, 3s timeout)
+            # V24.0 / V27.7: Intelligence Mesh (funding+reviews, residual budget,
+            # 48h domain cache). Hiring removed — deep_context already covered it.
             try:
                 from services.serper_service import search_serper  # type: ignore[import]
                 company_for_mesh = evaluation.get("company_name")
                 domain_for_mesh = extract_root_domain(url) if url else None
                 if domain_for_mesh:
+                    def _mesh_serper(query, location=None, gl=None, **_kw):
+                        # Force residual so mesh counts against residual daily cap
+                        return search_serper(
+                            query,
+                            location=location,
+                            gl=gl,
+                            residual=True,
+                            campaign_id=campaign_id,
+                            tenant_id=tenant_id,
+                            sourcing_vector=sourcing_vector,
+                        )
+
                     mesh_signals = enrich_signals(
                         company_name=company_for_mesh,
                         domain=domain_for_mesh,
-                        serper_fn=search_serper,
+                        serper_fn=_mesh_serper,
                         timeout_s=3.0,
                     )
                     if mesh_signals:

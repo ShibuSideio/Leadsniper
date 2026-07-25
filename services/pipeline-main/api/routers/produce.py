@@ -970,18 +970,52 @@ def produce():
     if _v27_active and _intent_profile_dict.get("liquidity_level"):
         _liquidity_level = str(_intent_profile_dict.get("liquidity_level")).lower()
 
+    # V27.7: High-liquidity country codes must not dual-fire via forced
+    # low_liquidity (intent force_geo_global_fallback was burning 2× on IN/US).
+    _gl_norm = (gl or "").strip().lower()
+    try:
+        from shared.serper_enrichment_policy import HIGH_LIQUIDITY_GL  # type: ignore[import]
+        _high_gl = _gl_norm in HIGH_LIQUIDITY_GL
+    except Exception:
+        _high_gl = _gl_norm in {
+            "us", "in", "gb", "uk", "ae", "ca", "au", "de", "fr", "sg", "nl", "ie",
+        }
+    if _high_gl and _is_low_liquidity and _liquidity_level != "low":
+        log.info(
+            "produce_low_liquidity_cleared_high_gl",
+            campaign_id=campaign_id,
+            gl=_gl_norm,
+            liquidity_level=_liquidity_level,
+            note="V27.7: cleared forced low_liquidity for high-liquidity gl — "
+                 "stops dual geo+global on empty non-platform queries.",
+        )
+        _is_low_liquidity = False
+
     # ------------------------------------------------------------------
-    # V26 (Task 2.4): Case-insensitive deduplication of smart_keywords.
-    # Colloquial translation and multi-strategy queries can produce near-
-    # duplicate queries that waste Serper credits for identical results.
+    # V26 (Task 2.4) / V27.7: Dedup smart_keywords.
+    # Exact lowercase + fingerprint (strip negation tails) so near-duplicates
+    # that only differ in -wiki/-site: tails do not burn extra Serper credits.
     # ------------------------------------------------------------------
+    try:
+        from shared.serper_enrichment_policy import query_dedup_fingerprint  # type: ignore[import]
+    except Exception:
+        def query_dedup_fingerprint(q: str) -> str:  # type: ignore[misc]
+            return (q or "").strip().lower()
+
     _seen_queries: set[str] = set()
+    _seen_fps: set[str] = set()
     _deduped_keywords: list[str] = []
     for _kw in smart_keywords:
         _dedup_key = _kw.strip().lower()
-        if _dedup_key not in _seen_queries:
-            _seen_queries.add(_dedup_key)
-            _deduped_keywords.append(_kw)
+        _fp = query_dedup_fingerprint(_kw)
+        if _dedup_key in _seen_queries:
+            continue
+        if _fp and _fp in _seen_fps:
+            continue
+        _seen_queries.add(_dedup_key)
+        if _fp:
+            _seen_fps.add(_fp)
+        _deduped_keywords.append(_kw)
     _dedup_dropped = len(smart_keywords) - len(_deduped_keywords)
     if _dedup_dropped > 0:
         log.info(
@@ -990,7 +1024,7 @@ def produce():
             original_count=len(smart_keywords),
             deduped_count=len(_deduped_keywords),
             dropped=_dedup_dropped,
-            note="Case-insensitive dedup removed duplicate queries before Serper loop.",
+            note="V27.7 fingerprint+case dedup removed duplicate queries before Serper loop.",
         )
     smart_keywords = _deduped_keywords
     _governed = govern_query_portfolio(
@@ -1255,68 +1289,88 @@ def produce():
             _platform_queries_executed += 1
 
         if _is_consumer_vector:
-            # Consumer: geo-restricted first, then conditional global fallback
-            raw_results = search_serper(
-                search_query,
-                location=clean_location or None,
-                gl=gl or None,
-                campaign_id=campaign_id,
-                tenant_id=tenant_id,
-                sourcing_vector=sourcing_vector,
-            )
-            if not raw_results and gl:
-                _do_fallback, _fb_reason = should_attempt_geo_fallback(
-                    gl=gl,
-                    has_results=False,
-                    is_platform_query=_is_platform_query,
-                    low_liquidity=_is_low_liquidity,
+            # V27.7: site: platform queries (reddit/quora/linkedin/…) always global.
+            # Geo-restricted social indexes almost always return 0, then dual-fired
+            # global — burning 2 credits per platform query. Global-only = 1 credit.
+            if _is_platform_query:
+                log.info(
+                    "produce_platform_global_only",
+                    query=search_query[:80],
+                    campaign_id=campaign_id,
+                    gl=gl or None,
+                    note="V27.7: platform site: query skips geo — single global Serper call.",
                 )
-                if _do_fallback:
-                    _geo_fallbacks_attempted += 1
-                    log.info(
-                        "produce_geo_fallback_low_liquidity"
-                        if _fb_reason == "low_liquidity"
-                        else "produce_geo_fallback",
-                        query=search_query[:80],
-                        original_gl=gl,
-                        sourcing_vector=sourcing_vector,
-                        is_platform_query=_is_platform_query,
+                raw_results = search_serper(
+                    search_query,
+                    location=None,
+                    gl=None,
+                    campaign_id=campaign_id,
+                    tenant_id=tenant_id,
+                    sourcing_vector=sourcing_vector,
+                )
+            else:
+                # Consumer colloquial: geo-restricted first, then conditional global
+                raw_results = search_serper(
+                    search_query,
+                    location=clean_location or None,
+                    gl=gl or None,
+                    campaign_id=campaign_id,
+                    tenant_id=tenant_id,
+                    sourcing_vector=sourcing_vector,
+                )
+                if not raw_results and gl:
+                    _do_fallback, _fb_reason = should_attempt_geo_fallback(
+                        gl=gl,
+                        has_results=False,
+                        is_platform_query=False,
                         low_liquidity=_is_low_liquidity,
-                        liquidity_level=_liquidity_level,
-                        fallback_reason=_fb_reason,
-                        campaign_id=campaign_id,
-                        note=(
-                            "Geo returned 0; retrying once on global index."
-                            + (
-                                " Forced for low-liquidity market."
-                                if _fb_reason == "low_liquidity"
-                                else " Platform query eligible for global fallback."
-                            )
-                        ),
                     )
-                    raw_results = search_serper(
-                        search_query,
-                        location=None,
-                        gl=None,
-                        campaign_id=campaign_id,
-                        tenant_id=tenant_id,
-                        sourcing_vector=sourcing_vector,
-                    )
-                    if raw_results:
-                        _geo_fallbacks_succeeded += 1
-                else:
-                    log.info(
-                        "produce_geo_fallback_skipped",
-                        query=search_query[:80],
-                        original_gl=gl,
-                        sourcing_vector=sourcing_vector,
-                        low_liquidity=_is_low_liquidity,
-                        liquidity_level=_liquidity_level,
-                        fallback_reason=_fb_reason,
-                        campaign_id=campaign_id,
-                        note="Non-platform query returned 0 on geo in high/medium "
-                             "liquidity market — skipping global retry to save credits.",
-                    )
+                    if _do_fallback:
+                        _geo_fallbacks_attempted += 1
+                        log.info(
+                            "produce_geo_fallback_low_liquidity"
+                            if _fb_reason == "low_liquidity"
+                            else "produce_geo_fallback",
+                            query=search_query[:80],
+                            original_gl=gl,
+                            sourcing_vector=sourcing_vector,
+                            is_platform_query=False,
+                            low_liquidity=_is_low_liquidity,
+                            liquidity_level=_liquidity_level,
+                            fallback_reason=_fb_reason,
+                            campaign_id=campaign_id,
+                            note=(
+                                "Geo returned 0; retrying once on global index."
+                                + (
+                                    " Forced for low-liquidity market."
+                                    if _fb_reason == "low_liquidity"
+                                    else ""
+                                )
+                            ),
+                        )
+                        raw_results = search_serper(
+                            search_query,
+                            location=None,
+                            gl=None,
+                            campaign_id=campaign_id,
+                            tenant_id=tenant_id,
+                            sourcing_vector=sourcing_vector,
+                        )
+                        if raw_results:
+                            _geo_fallbacks_succeeded += 1
+                    else:
+                        log.info(
+                            "produce_geo_fallback_skipped",
+                            query=search_query[:80],
+                            original_gl=gl,
+                            sourcing_vector=sourcing_vector,
+                            low_liquidity=_is_low_liquidity,
+                            liquidity_level=_liquidity_level,
+                            fallback_reason=_fb_reason,
+                            campaign_id=campaign_id,
+                            note="Non-platform query returned 0 on geo in high/medium "
+                                 "liquidity market — skipping global retry to save credits.",
+                        )
         else:
             # B2B: global-only (geo terms already in query text from query_brain).
             raw_results = search_serper(
