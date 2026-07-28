@@ -122,6 +122,29 @@ function _resetSelect(el, placeholder) {
     }
 }
 
+/** V27.8.1: Mark region multiselect as "All" without requiring state pick. */
+function _setRegionSelectAll(regionEl) {
+    if (!regionEl) return;
+    regionEl.disabled = false;
+    regionEl.innerHTML = '<option value="All">All</option>';
+    regionEl.value = 'All';
+    const container = document.getElementById(regionEl.id + '-container');
+    if (container) {
+        const trigger = container.querySelector('.custom-multiselect-trigger');
+        const label = container.querySelector('.trigger-label');
+        if (trigger) trigger.classList.remove('disabled');
+        if (label) label.textContent = '📍 All';
+        if (typeof container.populateRegions === 'function') {
+            // Single synthetic choice so UI shows All selected
+            container.populateRegions(['All regions'], ['All']);
+            // Force select value back to All (populateRegions may set "All regions")
+            regionEl.innerHTML = '<option value="All">All</option>';
+            regionEl.value = 'All';
+            if (label) label.textContent = '📍 All';
+        }
+    }
+}
+
 function _updateGeoPreview() {
     const continent = document.getElementById('geo-continent-select')?.value || '';
     const country   = document.getElementById('geo-country-select')?.value   || '';
@@ -132,12 +155,22 @@ function _updateGeoPreview() {
     // Sync hidden fields for backward compat
     const glHidden  = document.getElementById('edit-camp-gl');
     const locHidden = document.getElementById('edit-camp-location');
-    if (glHidden)  glHidden.value  = _resolveGlCode(country) || '';
+    if (glHidden)  glHidden.value  = _resolveGlCode(country, continent) || '';
     if (locHidden) locHidden.value = compiled;
 }
 
+/**
+ * V27.8.1: Compile hierarchy to location string.
+ * Global → "Global". "All" at country/region is omitted so continent-only
+ * or country-wide targets stay clean (e.g. "Asia", "India, Asia").
+ */
 function _compileGeoString(continent, country, region) {
-    const parts = [region, country, continent].filter(Boolean);
+    if (!continent) return '';
+    if (continent === 'Global') return 'Global';
+    const parts = [];
+    if (region && region !== 'All' && region !== 'All regions') parts.push(region);
+    if (country && country !== 'All') parts.push(country);
+    parts.push(continent);
     return parts.join(', ');
 }
 
@@ -299,8 +332,9 @@ function setupCustomMultiselect(selectId, containerId, triggerId, dropdownId) {
 }
 
 
-function _resolveGlCode(countryName) {
-    if (!_geoDataCache || !countryName) return '';
+function _resolveGlCode(countryName, continentName) {
+    if (!countryName || countryName === 'All' || continentName === 'Global') return '';
+    if (!_geoDataCache) return '';
     for (const c of _geoDataCache.continents) {
         const match = c.countries.find(co => co.name === countryName);
         if (match) return match.gl || '';
@@ -308,88 +342,117 @@ function _resolveGlCode(countryName) {
     return '';
 }
 
-async function initGeoCascade(existingGeoHierarchy, existingGl, existingLocation) {
-    const data = await loadGeoData();
-    const continentEl = document.getElementById('geo-continent-select');
-    const countryEl   = document.getElementById('geo-country-select');
-    const regionEl    = document.getElementById('geo-region-select');
-    if (!continentEl || !countryEl || !regionEl) return;
-
-    // Set target selected regions for hydration
-    if (existingGeoHierarchy && existingGeoHierarchy.region) {
-        regionEl._targetSelectedRegions = existingGeoHierarchy.region.split(',').map(s => s.trim());
-    } else if (existingLocation) {
-        regionEl._targetSelectedRegions = [existingLocation];
-    } else {
-        regionEl._targetSelectedRegions = [];
-    }
-
-    // Populate continents
-    continentEl.innerHTML = '<option value="">🌍 Continent</option>';
+/**
+ * V27.8.1: Shared cascade wiring — Global + All country + All region.
+ * Selecting a continent no longer forces a specific country/state.
+ */
+function _wireGeoCascade(data, continentEl, countryEl, regionEl, updatePreview) {
+    // Populate continents: Global first, then named continents
+    continentEl.innerHTML = '<option value="">🌍 Continent / Global</option>';
+    continentEl.innerHTML += '<option value="Global">🌐 Global (worldwide)</option>';
     data.continents.forEach(c => {
         continentEl.innerHTML += `<option value="${_escapeHTML(c.name)}">${_escapeHTML(c.name)}</option>`;
     });
 
-    _resetSelect(countryEl, '🏳️ Country');
-    _resetSelect(regionEl,  '📍 Region');
+    _resetSelect(countryEl, '🏳️ Country / All');
+    _resetSelect(regionEl,  '📍 Region / All');
 
-    // Wire event listeners (remove old ones first to prevent duplication)
     continentEl.onchange = function() {
         const cName = this.value;
-        _resetSelect(countryEl, '🏳️ Country');
-        _resetSelect(regionEl,  '📍 Region');
-        if (!cName) { _updateGeoPreview(); return; }
+        _resetSelect(countryEl, '🏳️ Country / All');
+        _resetSelect(regionEl,  '📍 Region / All');
+        if (!cName) {
+            updatePreview();
+            return;
+        }
+        // Global: no country/state required
+        if (cName === 'Global') {
+            countryEl.disabled = false;
+            countryEl.innerHTML = '<option value="All">🏳️ All countries</option>';
+            countryEl.value = 'All';
+            _setRegionSelectAll(regionEl);
+            updatePreview();
+            return;
+        }
         const continent = data.continents.find(c => c.name === cName);
-        if (!continent) { _updateGeoPreview(); return; }
+        if (!continent) {
+            updatePreview();
+            return;
+        }
         countryEl.disabled = false;
+        countryEl.innerHTML = '<option value="All">🏳️ All countries</option>';
         continent.countries.forEach(co => {
             countryEl.innerHTML += `<option value="${_escapeHTML(co.name)}">${_escapeHTML(co.name)}</option>`;
         });
-        _updateGeoPreview();
+        // Default to All countries so continent-only campaigns work immediately
+        countryEl.value = 'All';
+        countryEl.onchange();
     };
 
     countryEl.onchange = function() {
         const coName = this.value;
-        _resetSelect(regionEl, '📍 Region');
-        if (!coName) { _updateGeoPreview(); return; }
+        _resetSelect(regionEl, '📍 Region / All');
+        if (!coName || coName === 'All') {
+            // Entire continent (or Global) — region defaults to All
+            if (continentEl.value) {
+                _setRegionSelectAll(regionEl);
+            }
+            updatePreview();
+            return;
+        }
         const continentName = continentEl.value;
+        if (continentName === 'Global') {
+            _setRegionSelectAll(regionEl);
+            updatePreview();
+            return;
+        }
         const continent = data.continents.find(c => c.name === continentName);
         const country   = continent?.countries.find(co => co.name === coName);
         if (!country || !country.regions || country.regions.length === 0) {
-            _updateGeoPreview();
+            _setRegionSelectAll(regionEl);
+            updatePreview();
             return;
         }
         regionEl.disabled = false;
         const container = document.getElementById(regionEl.id + '-container');
+        const preferred = regionEl._targetSelectedRegions || [];
+        // Default selection: All regions unless hydrating a specific region
+        const initial = preferred.length ? preferred : ['All'];
         if (container && typeof container.populateRegions === 'function') {
-            container.populateRegions(country.regions || [], regionEl._targetSelectedRegions || []);
+            container.populateRegions(country.regions || [], initial);
         } else {
+            regionEl.innerHTML = '<option value="All">📍 All</option>';
             country.regions.forEach(r => {
                 regionEl.innerHTML += `<option value="${_escapeHTML(r)}">${_escapeHTML(r)}</option>`;
             });
-            _updateGeoPreview();
+            regionEl.value = initial.includes('All') ? 'All' : (initial[0] || 'All');
+            updatePreview();
         }
     };
 
     regionEl.onchange = function() {
-        _updateGeoPreview();
+        updatePreview();
     };
+}
 
-    // ── Hydrate from existing data ──────────────────────────────────────────
+function _hydrateGeoCascade(data, continentEl, countryEl, regionEl, existingGeoHierarchy, existingGl, existingLocation, updatePreview) {
+    const previewFn = typeof updatePreview === 'function' ? updatePreview : _updateGeoPreview;
     if (existingGeoHierarchy && existingGeoHierarchy.continent) {
-        // Structured geo_hierarchy exists — use it directly
         continentEl.value = existingGeoHierarchy.continent;
         continentEl.onchange();
         if (existingGeoHierarchy.country) {
             countryEl.value = existingGeoHierarchy.country;
             countryEl.onchange();
-            if (existingGeoHierarchy.region && !document.getElementById(regionEl.id + '-container')) {
+            if (existingGeoHierarchy.region && existingGeoHierarchy.region !== 'All'
+                && !document.getElementById(regionEl.id + '-container')) {
                 regionEl.value = existingGeoHierarchy.region;
                 regionEl.onchange();
             }
         }
+    } else if (existingLocation && String(existingLocation).toLowerCase() === 'global') {
+        continentEl.value = 'Global';
+        continentEl.onchange();
     } else if (existingGl) {
-        // Legacy: try to reverse-map the gl code to continent/country
         for (const cont of data.continents) {
             const match = cont.countries.find(co => co.gl === existingGl);
             if (match) {
@@ -397,9 +460,8 @@ async function initGeoCascade(existingGeoHierarchy, existingGl, existingLocation
                 continentEl.onchange();
                 countryEl.value = match.name;
                 countryEl.onchange();
-                // Try to match the location string to a region
                 if (existingLocation) {
-                    const regionMatch = match.regions.find(
+                    const regionMatch = (match.regions || []).find(
                         r => existingLocation.toLowerCase().includes(r.toLowerCase())
                     );
                     if (regionMatch) {
@@ -417,7 +479,30 @@ async function initGeoCascade(existingGeoHierarchy, existingGl, existingLocation
             }
         }
     }
-    _updateGeoPreview();
+    previewFn();
+}
+
+/** Edit-campaign modal: #geo-continent-select / country / region */
+async function initGeoCascade(existingGeoHierarchy, existingGl, existingLocation) {
+    const data = await loadGeoData();
+    const continentEl = document.getElementById('geo-continent-select');
+    const countryEl   = document.getElementById('geo-country-select');
+    const regionEl    = document.getElementById('geo-region-select');
+    if (!continentEl || !countryEl || !regionEl) return;
+
+    if (existingGeoHierarchy && existingGeoHierarchy.region) {
+        regionEl._targetSelectedRegions = existingGeoHierarchy.region.split(',').map(s => s.trim());
+    } else if (existingLocation) {
+        regionEl._targetSelectedRegions = [existingLocation];
+    } else {
+        regionEl._targetSelectedRegions = [];
+    }
+
+    _wireGeoCascade(data, continentEl, countryEl, regionEl, _updateGeoPreview);
+    _hydrateGeoCascade(
+        data, continentEl, countryEl, regionEl,
+        existingGeoHierarchy, existingGl, existingLocation, _updateGeoPreview
+    );
 }
 
 // =============================================================================
@@ -435,7 +520,6 @@ async function initGeoCascadeFor(prefix, existingGeoHierarchy, existingGl, exist
 
     if (!continentEl || !countryEl || !regionEl) return;
 
-    // Set target selected regions for hydration
     if (existingGeoHierarchy && existingGeoHierarchy.region) {
         regionEl._targetSelectedRegions = existingGeoHierarchy.region.split(',').map(s => s.trim());
     } else if (existingLocation) {
@@ -450,97 +534,15 @@ async function initGeoCascadeFor(prefix, existingGeoHierarchy, existingGl, exist
         const region    = regionEl.value    || '';
         const compiled  = _compileGeoString(continent, country, region);
         if (previewEl) previewEl.textContent = compiled ? `📍 ${compiled}` : '';
-        if (glHidden)  glHidden.value  = _resolveGlCode(country) || '';
+        if (glHidden)  glHidden.value  = _resolveGlCode(country, continent) || '';
         if (locHidden) locHidden.value = compiled;
     }
 
-    // Populate continents
-    continentEl.innerHTML = '<option value="">🌍 Continent</option>';
-    data.continents.forEach(c => {
-        continentEl.innerHTML += `<option value="${_escapeHTML(c.name)}">${_escapeHTML(c.name)}</option>`;
-    });
-    _resetSelect(countryEl, '🏳️ Country');
-    _resetSelect(regionEl,  '📍 Region');
-
-    continentEl.onchange = function() {
-        const cName = this.value;
-        _resetSelect(countryEl, '🏳️ Country');
-        _resetSelect(regionEl,  '📍 Region');
-        if (!cName) { updatePreview(); return; }
-        const continent = data.continents.find(c => c.name === cName);
-        if (!continent) { updatePreview(); return; }
-        countryEl.disabled = false;
-        continent.countries.forEach(co => {
-            countryEl.innerHTML += `<option value="${_escapeHTML(co.name)}">${_escapeHTML(co.name)}</option>`;
-        });
-        updatePreview();
-    };
-
-    countryEl.onchange = function() {
-        const coName = this.value;
-        _resetSelect(regionEl, '📍 Region');
-        if (!coName) { updatePreview(); return; }
-        const continentName = continentEl.value;
-        const continent = data.continents.find(c => c.name === continentName);
-        const country   = continent?.countries.find(co => co.name === coName);
-        if (!country || !country.regions || country.regions.length === 0) {
-            updatePreview();
-            return;
-        }
-        regionEl.disabled = false;
-        const container = document.getElementById(regionEl.id + '-container');
-        if (container && typeof container.populateRegions === 'function') {
-            container.populateRegions(country.regions || [], regionEl._targetSelectedRegions || []);
-        } else {
-            country.regions.forEach(r => {
-                regionEl.innerHTML += `<option value="${_escapeHTML(r)}">${_escapeHTML(r)}</option>`;
-            });
-            updatePreview();
-        }
-    };
-
-    regionEl.onchange = function() { updatePreview(); };
-
-    // ── Hydrate from existing data ──────────────────────────────────────
-    if (existingGeoHierarchy && existingGeoHierarchy.continent) {
-        continentEl.value = existingGeoHierarchy.continent;
-        continentEl.onchange();
-        if (existingGeoHierarchy.country) {
-            countryEl.value = existingGeoHierarchy.country;
-            countryEl.onchange();
-            if (existingGeoHierarchy.region && !document.getElementById(regionEl.id + '-container')) {
-                regionEl.value = existingGeoHierarchy.region;
-                regionEl.onchange();
-            }
-        }
-    } else if (existingGl) {
-        for (const cont of data.continents) {
-            const match = cont.countries.find(co => co.gl === existingGl);
-            if (match) {
-                continentEl.value = cont.name;
-                continentEl.onchange();
-                countryEl.value = match.name;
-                countryEl.onchange();
-                if (existingLocation) {
-                    const regionMatch = match.regions?.find(
-                        r => existingLocation.toLowerCase().includes(r.toLowerCase())
-                    );
-                    if (regionMatch) {
-                        regionEl._targetSelectedRegions = [regionMatch];
-                        const container = document.getElementById(regionEl.id + '-container');
-                        if (container && typeof container.populateRegions === 'function') {
-                            container.populateRegions(match.regions || [], [regionMatch]);
-                        } else {
-                            regionEl.value = regionMatch;
-                            regionEl.onchange();
-                        }
-                    }
-                }
-                break;
-            }
-        }
-    }
-    updatePreview();
+    _wireGeoCascade(data, continentEl, countryEl, regionEl, updatePreview);
+    _hydrateGeoCascade(
+        data, continentEl, countryEl, regionEl,
+        existingGeoHierarchy, existingGl, existingLocation, updatePreview
+    );
 }
 
 // Toast — defined as function declaration so it is hoisted and available
@@ -1752,17 +1754,26 @@ window.saveEditedCampaign = async function() {
     // gl + location are synced from cascade via hidden inputs (_updateGeoPreview)
     const gl       = document.getElementById('edit-camp-gl')?.value        || '';
     const location = document.getElementById('edit-camp-location')?.value  || '';
-    // Build structured geo_hierarchy for future use
+    // Build structured geo_hierarchy (V27.8.1: empty country/region → All)
+    const _ghContinent = document.getElementById('geo-continent-select')?.value || '';
     const geo_hierarchy = {
-        continent: document.getElementById('geo-continent-select')?.value || '',
-        country:   document.getElementById('geo-country-select')?.value   || '',
-        region:    document.getElementById('geo-region-select')?.value    || '',
+        continent: _ghContinent,
+        country:   document.getElementById('geo-country-select')?.value   || (_ghContinent ? 'All' : ''),
+        region:    document.getElementById('geo-region-select')?.value    || (_ghContinent ? 'All' : ''),
     };
     if (!id)   { showToast('Campaign ID missing. Please refresh.', 'error'); return; }
     if (!name) { showToast('Campaign name is required.', 'error'); return; }
+    if (!geo_hierarchy.continent) {
+        showToast('Target Geography is required. Select Global or a continent.', 'error');
+        return;
+    }
 
     // V26.0.2: Strategy is 100% backend — no client-side override
-    const payload = { name, bio, keywords, gl, location, geo_hierarchy };
+    const payload = {
+        name, bio, keywords, gl,
+        location: location || _compileGeoString(geo_hierarchy.continent, geo_hierarchy.country, geo_hierarchy.region),
+        geo_hierarchy,
+    };
 
     try {
         const success = await performApiMutation(`/api/campaigns/${id}`, 'PUT', payload);
@@ -5151,11 +5162,15 @@ window.saveChildCampaign = async function() {
         nameEl?.focus();
         return;
     }
+    // V27.8.1: Continent OR Global is enough — country/state default to All
     if (!ccContinent) {
-        showToast('Target Geography is required. Please select at least a continent.', 'error');
+        showToast('Target Geography is required. Select Global or a continent (country/region optional — use All).', 'error');
         document.getElementById('cc-geo-continent')?.focus();
         return;
     }
+    // Normalize empty country/region to All for structured storage
+    const normCountry = ccCountry || 'All';
+    const normRegion  = ccRegion  || 'All';
 
     window._selectedPersonaId = selPid;
 
@@ -5181,8 +5196,8 @@ window.saveChildCampaign = async function() {
         pain_point:        pain,
         unfair_advantage:  adv,
         gl:                gl,
-        location:          loc,
-        geo_hierarchy:     { continent: ccContinent, country: ccCountry, region: ccRegion }
+        location:          loc || _compileGeoString(ccContinent, normCountry, normRegion),
+        geo_hierarchy:     { continent: ccContinent, country: normCountry, region: normRegion }
     });
 };
 

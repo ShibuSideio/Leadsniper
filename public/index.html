@@ -50,7 +50,7 @@
     <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-auth.js"></script>
     <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-firestore.js"></script>
     <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-storage.js"></script>
-    <link rel="stylesheet" href="styles.css?v=27.6.0">
+    <link rel="stylesheet" href="styles.css?v=27.8.1">
     <style>
         /* ── MODAL SYSTEM ────────────────────────────────── */
         .sio-modal-overlay {
@@ -1254,12 +1254,13 @@
 
                 <div style="margin-bottom:14px;">
                     <label style="font-size:0.8rem; font-weight:600; color:#374151; display:block; margin-bottom:6px;">Target Geography <span style="color:#ef4444;">*</span></label>
+                    <p style="font-size:0.72rem; color:#9ca3af; margin:0 0 6px;">Select <strong>Global</strong> or a continent. Country and region default to <strong>All</strong> — narrow only if needed.</p>
                     <div style="display:flex; gap:8px; flex-wrap:wrap;">
-                        <select id="cc-geo-continent" class="edit-field-input geo-cascade-select" style="flex:1; min-width:110px; padding:10px; border:1px solid #d1d5db; border-radius:8px; font-family:'Inter',sans-serif; cursor:pointer;" aria-label="Select continent">
-                            <option value="">🌍 Continent</option>
+                        <select id="cc-geo-continent" class="edit-field-input geo-cascade-select" style="flex:1; min-width:110px; padding:10px; border:1px solid #d1d5db; border-radius:8px; font-family:'Inter',sans-serif; cursor:pointer;" aria-label="Select continent or Global">
+                            <option value="">🌍 Continent / Global</option>
                         </select>
-                        <select id="cc-geo-country" class="edit-field-input geo-cascade-select" style="flex:1; min-width:110px; padding:10px; border:1px solid #d1d5db; border-radius:8px; font-family:'Inter',sans-serif; cursor:pointer;" disabled aria-label="Select country">
-                            <option value="">🏳️ Country</option>
+                        <select id="cc-geo-country" class="edit-field-input geo-cascade-select" style="flex:1; min-width:110px; padding:10px; border:1px solid #d1d5db; border-radius:8px; font-family:'Inter',sans-serif; cursor:pointer;" disabled aria-label="Select country or All countries">
+                            <option value="">🏳️ Country / All</option>
                         </select>
                         <select id="cc-geo-region" class="edit-field-input geo-cascade-select" style="display:none;" disabled aria-label="Select region">
                             <option value="">📍 Region</option>
@@ -1567,6 +1568,6 @@
         });
     }
 </script>
-<script src="app.js?v=27.6.0"></script>
+<script src="app.js?v=27.8.1"></script>
 </body>
 </html>

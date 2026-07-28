@@ -1,4 +1,4 @@
-const CACHE_NAME = 'sideio-v27.6.0'; // V27.6.0: lead export JSON/CSV all fields
+const CACHE_NAME = 'sideio-v27.8.1'; // V27.8.1: geo Global + All country/region; 3m freshness
 const ASSETS_TO_CACHE = [
      '/',
      '/index.html',
