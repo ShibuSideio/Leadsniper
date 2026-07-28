@@ -887,7 +887,8 @@ class InboundSentimentService:
         
         # V27.5: Default 6-month window (was qdr:y — year-old forum noise).
         # Override via campaign.inbound_timeframe if needed.
-        timeframe = self.campaign.get("inbound_timeframe") or "qdr:6m"
+        # V27.8: default 3-month rolling window (was qdr:6m)
+        timeframe = self.campaign.get("inbound_timeframe") or "qdr:3m"
         payload = {"q": query, "num": num, "gl": gl, "hl": "en"}
         if timeframe and timeframe != "all":
             payload["tbs"] = timeframe

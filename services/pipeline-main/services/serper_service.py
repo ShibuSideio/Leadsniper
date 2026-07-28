@@ -942,13 +942,11 @@ def search_serper(
         }
         payload_dict["hl"] = _HL_BY_GL.get(str(gl).lower(), "en")
 
-    # V26.0.5 / V27.5: Smart time filter based on query structure.
-    # Decision matrix:
-    #   site: social/forum (reddit, quora, linkedin, …) → qdr:6m (product rule)
+    # V26.0.5 / V27.8: Smart time filter based on query structure.
+    # Decision matrix (product rule: **3-month rolling** = qdr:3m):
+    #   site: social/forum (reddit, quora, linkedin, …) → qdr:3m
     #   site: evergreen platforms (directories, listings) → NO time filter
-    #   B2C non-site colloquial                          → qdr:6m
-    #   B2B non-site colloquial                          → qdr:6m (was qdr:2y —
-    #       year-old social/forum threads leaked into investor/B2B campaigns)
+    #   B2C / B2B non-site colloquial                     → qdr:3m
     import re as _re_tbs
     _query_body_tbs = _re_tbs.split(
         r'\s+-(?:site:|wiki\b|jobs\b|")', query, maxsplit=1
@@ -971,22 +969,22 @@ def search_serper(
     )
 
     if _has_positive_site and _is_social_forum_query:
-        # V27.5: social/forum site: dorks still get 6-month freshness
-        payload_dict["tbs"] = "qdr:6m"
+        # V27.8: social/forum site: dorks — 3-month freshness
+        payload_dict["tbs"] = "qdr:3m"
         log.info(
             "serper_tbs_social_forum",
-            tbs="qdr:6m",
+            tbs="qdr:3m",
             query=query[:100],
-            note="Social/forum site: query — 6-month window (not evergreen).",
+            note="Social/forum site: query — 3-month window (V27.8).",
         )
     elif _has_positive_site:
         # Evergreen platform mining — no time restriction
         pass
     elif sourcing_vector and _is_consumer_archetype(sourcing_vector):
-        payload_dict["tbs"] = "qdr:6m"
+        payload_dict["tbs"] = "qdr:3m"
     else:
-        # V27.5: B2B colloquial also 6 months (was 2 years — too cold for forums)
-        payload_dict["tbs"] = "qdr:6m"
+        # V27.8: B2B colloquial also 3 months
+        payload_dict["tbs"] = "qdr:3m"
 
     payload = json.dumps(payload_dict)
     headers = {"X-API-KEY": api_key, "Content-Type": "application/json"}

@@ -56,15 +56,15 @@ def should_attempt_geo_fallback(
 
 
 # ---------------------------------------------------------------------------
-# V25.5.0 / V27.5.0: Content age filter — reject stale Reddit/forum posts
+# V25.5.0 / V27.8: Content age filter — reject stale social/forum posts
 # ---------------------------------------------------------------------------
-# Product rule (V27.5): social/forum results older than 6 months are irrelevant.
-# Evergreen directory/agent profiles remain on the looser B2C window when the
-# host is NOT a social/forum domain.
+# Product rule (V27.8): **3-month rolling window (90 days)** for ALL content
+# including Reddit/Quora/LinkedIn. Undated social fails closed. Non-thread
+# Reddit listings (/rising, /hot, subreddit roots, /user/) are always rejected.
 
-_STALE_DAYS_B2C = 90    # Non-social consumer (listings, directories)
-_STALE_DAYS_B2B = 60    # Non-social B2B discussions
-_STALE_DAYS_SOCIAL = 180  # V27.5: Reddit/Quora/LinkedIn/forums — hard 6 months
+_STALE_DAYS_B2C = 90
+_STALE_DAYS_B2B = 90
+_STALE_DAYS_SOCIAL = 90  # V27.8: unified 3-month rolling validity
 
 _SOCIAL_STALE_HOST_HINTS = (
     "reddit.com", "quora.com", "linkedin.com", "facebook.com",
@@ -73,10 +73,43 @@ _SOCIAL_STALE_HOST_HINTS = (
     "stackexchange.com", "stackoverflow.com", "news.ycombinator.com",
 )
 
+# Reddit base36 post-id floor for ~90d lookback (updated with product window).
+# IDs strictly below this are treated as older than the rolling window when
+# Serper omits date. Calibrated for mid-2026 traffic; fail-closed still applies.
+_REDDIT_ID_MIN_RECENT = "1s00000"  # ~early 2026 — older base36 → reject
+
 
 def _result_is_social_forum(result: dict) -> bool:
     link = (result.get("link") or result.get("url") or "").lower()
     return any(h in link for h in _SOCIAL_STALE_HOST_HINTS)
+
+
+def _is_reddit_non_thread_url(url: str) -> bool:
+    """True for subreddit hubs, sort views, and user profiles — not a post."""
+    u = (url or "").lower().split("?", 1)[0].rstrip("/")
+    if "reddit.com" not in u:
+        return False
+    if "/user/" in u or "/u/" in u:
+        return True
+    if re.search(r"/r/[^/]+/(rising|hot|new|top|best)(/|$)", u):
+        return True
+    # Subreddit root: /r/name or /r/name/ with no /comments/
+    if re.search(r"/r/[^/]+/?$", u) and "/comments/" not in u:
+        return True
+    return False
+
+
+def _reddit_post_id_from_url(url: str) -> str | None:
+    m = re.search(r"reddit\.com/r/[^/]+/comments/([a-z0-9]+)/", (url or "").lower())
+    return m.group(1) if m else None
+
+
+def _reddit_id_is_older_than_window(post_id: str, min_recent: str = _REDDIT_ID_MIN_RECENT) -> bool:
+    """Compare base36 post ids — lower id ⇒ older post."""
+    try:
+        return int(post_id, 36) < int(min_recent, 36)
+    except (ValueError, TypeError):
+        return False
 
 
 def _age_days_from_serper_date(raw_date: str) -> int | None:
@@ -122,41 +155,48 @@ def _age_days_from_serper_date(raw_date: str) -> int | None:
 def _is_stale_content(result: dict, is_consumer: bool) -> bool:
     """Return True if Serper result is too old to be actionable.
 
-    V27.5: Social/forum hosts use a hard 6-month window. Non-social keeps
-    B2C=90d / B2B=60d. When Serper omits ``date``, social results still check
-    title/snippet for year markers (e.g. 2023, 2024); non-social fail-open.
+    V27.8: Unified **90-day (3-month)** rolling window for social and non-social.
+    Social undated → fail-closed. Reddit non-thread URLs always stale/invalid.
     """
+    link = (result.get("link") or result.get("url") or "")
     is_social = _result_is_social_forum(result)
     max_days = _STALE_DAYS_SOCIAL if is_social else (
         _STALE_DAYS_B2C if is_consumer else _STALE_DAYS_B2B
     )
+
+    # Always drop Reddit listings / profiles (not a person-intent thread)
+    if _is_reddit_non_thread_url(link):
+        return True
 
     raw_date = (result.get("date") or "").strip()
     age = _age_days_from_serper_date(raw_date)
     if age is not None:
         return age > max_days
 
-    # Social/forum without date: scan title+snippet for calendar years
+    # Reddit post-id floor when Serper omits date
+    rid = _reddit_post_id_from_url(link)
+    if rid and _reddit_id_is_older_than_window(rid):
+        return True
+
+    # Social/forum without date: year markers in title/snippet
     if is_social:
         blob = f"{result.get('title') or ''} {result.get('snippet') or ''}"
         years = [int(y) for y in re.findall(r"\b(20\d{2})\b", blob)]
         if years:
             oldest = min(years)
-            now_y = datetime.now(timezone.utc).year
-            # Any year older than current calendar year - 1 is > ~6–18 months
-            if oldest < now_y and (now_y - oldest) >= 1:
-                # e.g. now 2026, year 2024 → stale; year 2025 might be within 6m early in 2026
-                if oldest <= now_y - 1:
-                    # Mid-year of that year vs now
-                    try:
-                        mid = datetime(oldest, 7, 1, tzinfo=timezone.utc)
-                        age_y = (datetime.now(timezone.utc) - mid).days
-                        if age_y > max_days:
-                            return True
-                    except ValueError:
-                        return True
-        # No date at all on social — fail-open but log-friendly caller counts
-        return False
+            try:
+                mid = datetime(oldest, 7, 1, tzinfo=timezone.utc)
+                age_y = (datetime.now(timezone.utc) - mid).days
+                if age_y > max_days:
+                    return True
+            except ValueError:
+                return True
+        # Reddit with post id at/above floor and no contrary year → allow
+        if rid and not _reddit_id_is_older_than_window(rid):
+            return False
+        # V27.8: undated social without a recent Reddit id — fail-closed
+        # (was fail-open — admitted multi-year threads with empty Serper date)
+        return True
 
     return False  # Non-social, unparseable — fail-open
 from services.query_brain import generate_smart_query  # type: ignore[import]
