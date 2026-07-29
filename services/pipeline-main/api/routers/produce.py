@@ -1526,6 +1526,17 @@ def produce():
     # Social-aware global deduplication
     # ------------------------------------------------------------------
     existing_ids: set[str] = set()
+    known_docs: list = []
+    _dedup_recrawl_days = max(1, min(120, int(os.environ.get("DEDUP_RECRAWL_DAYS", "30"))))
+    _dedup_cutoff = datetime.now(timezone.utc) - timedelta(days=_dedup_recrawl_days)
+    # defaults if import fails inside try
+    def is_terminal_non_lead(s):  # type: ignore
+        return str(s or "").lower() in {
+            "scored_out", "rlhf_filtered", "failed", "failed_scrape",
+            "failed_eval", "failed_vertex_timeout", "duplicate",
+        }
+    def resolve_lead_url(d):  # type: ignore
+        return str((d or {}).get("source_url") or (d or {}).get("url") or "")
     try:
         # V27.2.0 scale: paginated dedup scan (was hard 500 — re-queue risk at 1k+ users).
         # Pages of DEDUP_SCAN_PAGE_SIZE up to DEDUP_SCAN_LIMIT; reads url + source_url.
@@ -1539,17 +1550,13 @@ def produce():
             _DEDUP_PAGE = 500
         try:
             from shared.lead_identity import (  # type: ignore[import]
-                is_terminal_non_lead,
-                resolve_lead_url,
+                is_terminal_non_lead as _itnl,
+                resolve_lead_url as _rlu,
             )
+            is_terminal_non_lead = _itnl  # type: ignore
+            resolve_lead_url = _rlu  # type: ignore
         except Exception:
-            def is_terminal_non_lead(s):  # type: ignore
-                return str(s or "").lower() in {
-                    "scored_out", "rlhf_filtered", "failed", "failed_scrape",
-                    "failed_eval", "failed_vertex_timeout",
-                }
-            def resolve_lead_url(d):  # type: ignore
-                return str((d or {}).get("source_url") or (d or {}).get("url") or "")
+            pass
 
         known_docs = []
         _q = (
@@ -1593,8 +1600,6 @@ def produce():
                 .limit(_DEDUP_SCAN_LIMIT)
                 .stream()
             )
-        _dedup_recrawl_days = max(1, min(120, int(os.environ.get("DEDUP_RECRAWL_DAYS", "30"))))
-        _dedup_cutoff = datetime.now(timezone.utc) - timedelta(days=_dedup_recrawl_days)
         if len(known_docs) >= _DEDUP_SCAN_LIMIT:
             log.warning(
                 "produce_dedup_scan_cap_hit",
@@ -1627,9 +1632,53 @@ def produce():
     except Exception as exc:
         log.warning("produce_dedup_query_failed", error=str(exc))
 
+    # V27.9: Also track existing root domains so same portal ≠ many page URLs.
+    # Historical leads may only have url/source_url (no domain field).
+    existing_domains: set[str] = set()
+    try:
+        for doc in known_docs:
+            lead_data = doc.to_dict() or {}
+            _st = str(lead_data.get("status") or "").strip().lower()
+            if is_terminal_non_lead(_st):
+                continue
+            _u = resolve_lead_url(lead_data)
+            if not _u:
+                continue
+            if not _is_recent_for_dedup(lead_data.get("createdAt"), _dedup_cutoff):
+                continue
+            _d = extract_root_domain(_u)
+            if _d:
+                existing_domains.add(_d.lower().replace("www.", ""))
+    except Exception as _dom_err:
+        log.warning("produce_domain_set_build_failed", error=str(_dom_err))
+
+    try:
+        from shared.multi_entity_hosts import (  # type: ignore[import]
+            is_junk_portal_path,
+            is_multi_entity_host,
+        )
+    except Exception:
+        def is_junk_portal_path(_u):  # type: ignore
+            return False
+        def is_multi_entity_host(_d):  # type: ignore
+            return False
+
     fresh_urls: list[str] = []
     _multi_entity_fresh = 0
+    _batch_domains: set[str] = set()
+    _skipped_junk = 0
+    _skipped_domain_dup = 0
     for url in raw_urls:
+        _root = (extract_root_domain(url) or "").lower().replace("www.", "")
+        _is_social_u = any(_root.endswith(s) for s in _SOCIAL_DOMAINS_PRODUCER) if _root else False
+        _is_shared_u = any(_root.endswith(s) for s in shared_platforms) if _root else False
+        _is_multi_u = bool(_root and is_multi_entity_host(_root))
+
+        # Junk portal paths (privacy/login/tag) — never queue
+        if _root and not _is_social_u and not _is_shared_u and is_junk_portal_path(url):
+            _skipped_junk += 1
+            continue
+
         dedup_key, _fresh_meta = _produce_identity_key(
             url,
             sourcing_vector=sourcing_vector,
@@ -1639,8 +1688,34 @@ def produce():
         if _fresh_meta.get("multi_entity_host"):
             _multi_entity_fresh += 1
         lead_hash = hashlib.sha256(f"{tenant_id}_{dedup_key}".encode()).hexdigest()
-        if lead_hash not in existing_ids and url not in existing_ids:
-            fresh_urls.append(url)
+        if lead_hash in existing_ids or url in existing_ids:
+            continue
+
+        # V27.9: Same-domain collapse for single-entity company/portal sites.
+        # Different pages of one site (About / Team / Portfolio) are one lead.
+        # Social + multi-entity portals keep path-level uniqueness.
+        if (
+            _root
+            and not _is_social_u
+            and not _is_shared_u
+            and not _is_multi_u
+            and (_root in existing_domains or _root in _batch_domains)
+        ):
+            _skipped_domain_dup += 1
+            log.info(
+                "produce_skip_dup_domain",
+                domain=_root,
+                url=url[:100],
+                campaign_id=campaign_id,
+                note="V27.9: same root domain already queued/known — skip sibling page.",
+            )
+            continue
+
+        fresh_urls.append(url)
+        existing_ids.add(lead_hash)
+        existing_ids.add(url)
+        if _root and not _is_social_u and not _is_shared_u and not _is_multi_u:
+            _batch_domains.add(_root)
 
     duped_count  = fetched_count - len(fresh_urls)
     queued_count = len(fresh_urls)
@@ -1659,6 +1734,8 @@ def produce():
         deduplicated=duped_count,
         queued=queued_count,
         multi_entity_urls=_multi_entity_fresh,
+        skipped_junk_path=_skipped_junk,
+        skipped_domain_dup=_skipped_domain_dup,
     )
 
     # ------------------------------------------------------------------

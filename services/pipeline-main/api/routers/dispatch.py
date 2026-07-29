@@ -186,6 +186,113 @@ def _resolve_url_identity(
     return domain, identity_key, meta
 
 
+def _campaign_already_has_domain(
+    tenant_id: str,
+    campaign_id: str,
+    domain: str,
+    *,
+    lookback_days: int = 90,
+) -> bool:
+    """True if tenant already has a non-terminal lead for this domain in campaign.
+
+    V27.9: Prevents same company portal (different paths) flooding one campaign.
+    Fail-open (False) on query errors so missing indexes cannot freeze dispatch.
+    """
+    domain = (domain or "").lower().replace("www.", "").strip()
+    if not domain or not tenant_id or not campaign_id:
+        return False
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+        days=max(1, int(lookback_days))
+    )
+    try:
+        from shared.lead_identity import is_terminal_non_lead  # type: ignore[import]
+    except Exception:
+        def is_terminal_non_lead(s):  # type: ignore
+            return str(s or "").lower() in {
+                "scored_out", "rlhf_filtered", "failed", "failed_scrape",
+                "failed_eval", "failed_vertex_timeout", "duplicate",
+            }
+    try:
+        # Prefer domain field (written on stubs from V27.9+)
+        snaps = list(
+            _db().collection("leads")
+            .where(filter=FieldFilter("tenant_id", "==", tenant_id))
+            .where(filter=FieldFilter("domain", "==", domain))
+            .order_by("createdAt", direction=firestore.Query.DESCENDING)
+            .limit(15)
+            .stream()
+        )
+    except Exception:
+        try:
+            snaps = list(
+                _db().collection("leads")
+                .where(filter=FieldFilter("tenant_id", "==", tenant_id))
+                .where(filter=FieldFilter("domain", "==", domain))
+                .limit(15)
+                .stream()
+            )
+        except Exception as exc:
+            log.warning(
+                "dispatch_domain_inventory_query_failed",
+                domain=domain,
+                error=str(exc),
+                note="Fail-open: domain inventory treated as empty.",
+            )
+            return False
+
+    def _snap_matches(snap) -> bool:
+        data = snap.to_dict() or {}
+        status = str(data.get("status") or "").strip().lower()
+        # Terminal failures do not block; processing/new/etc. do
+        if is_terminal_non_lead(status):
+            return False
+        created = data.get("createdAt")
+        if created is not None and hasattr(created, "timestamp"):
+            try:
+                if datetime.datetime.fromtimestamp(
+                    created.timestamp(), tz=datetime.timezone.utc
+                ) < cutoff:
+                    return False
+            except Exception:
+                pass
+        camps = data.get("matched_campaigns") or data.get("matched_campaign_ids") or []
+        cid = str(data.get("campaign_id") or data.get("highest_campaign_id") or "")
+        if campaign_id != cid and campaign_id not in [str(c) for c in camps]:
+            return False
+        d_field = str(data.get("domain") or "").lower().replace("www.", "")
+        if d_field == domain:
+            return True
+        url = str(data.get("source_url") or data.get("url") or "").lower()
+        return domain in url
+
+    if any(_snap_matches(s) for s in snaps):
+        return True
+
+    # Fallback: campaign array scan (legacy leads without domain field)
+    try:
+        camp_snaps = list(
+            _db().collection("leads")
+            .where(filter=FieldFilter("tenant_id", "==", tenant_id))
+            .where(filter=FieldFilter("matched_campaigns", "array_contains", campaign_id))
+            .limit(80)
+            .stream()
+        )
+        for snap in camp_snaps:
+            data = snap.to_dict() or {}
+            if is_terminal_non_lead(str(data.get("status") or "")):
+                continue
+            d_field = str(data.get("domain") or "").lower().replace("www.", "")
+            url = str(data.get("source_url") or data.get("url") or "").lower()
+            if d_field == domain or domain in url:
+                return True
+    except Exception as exc:
+        log.warning(
+            "dispatch_domain_inventory_campaign_fallback_failed",
+            error=str(exc),
+        )
+    return False
+
+
 def _campaign_medium_quota_limit(campaign: dict) -> int:
     """Per-campaign Medium intake soft quota (24h). 0 = disabled."""
     if not MEDIUM_CAMPAIGN_QUOTA_ENABLED:
@@ -1113,6 +1220,50 @@ def dispatch():
             shared_platforms=SHARED_PLATFORMS,
             include_fragment=True,
         )
+        _is_multi_entity = bool(_lock_id_meta.get("multi_entity_host"))
+
+        # V27.9: Junk portal paths (privacy/login/tag) — skip before lock/PRISM
+        if not is_social and not is_shared:
+            try:
+                from shared.multi_entity_hosts import is_junk_portal_path  # type: ignore[import]
+                if is_junk_portal_path(url):
+                    log.info(
+                        "dispatch_skip_junk_path",
+                        url=url[:100],
+                        domain=target_domain,
+                        note="V27.9: policy/noise path — not a buyer entity.",
+                    )
+                    return {"url": url, "status": "skip_dup", "reason": "junk_path"}
+            except Exception as _jp_err:
+                log.warning("dispatch_junk_path_check_failed", error=str(_jp_err))
+
+        # V27.9: Campaign same-domain skip for single-entity hosts.
+        # Different pages of one company/portal (About/Team/Portfolio) collapse
+        # to one lead — further pages marked/skipped as duplicate.
+        if not is_social and not is_shared and not _is_multi_entity:
+            try:
+                if _campaign_already_has_domain(
+                    tenant_id, campaign_id, target_domain
+                ):
+                    log.info(
+                        "dispatch_skip_dup_domain",
+                        url=url[:100],
+                        domain=target_domain,
+                        campaign_id=campaign_id,
+                        note="V27.9: root domain already has a lead for this campaign.",
+                    )
+                    return {
+                        "url": url,
+                        "status": "skip_dup",
+                        "reason": "same_domain_campaign",
+                    }
+            except Exception as _dom_dup_err:
+                log.warning(
+                    "dispatch_domain_dup_check_failed",
+                    error=str(_dom_dup_err),
+                    note="Fail-open: continue without domain inventory check.",
+                )
+
         if _lock_id_meta.get("identity_mode") == "path":
             lock_entity = hashlib.sha256(dedupe_target.encode()).hexdigest()
         else:
@@ -1152,7 +1303,10 @@ def dispatch():
             doc_ref.create({
                 "tenant_id":         tenant_id,
                 "matched_campaigns": [campaign_id],
+                "campaign_id":       campaign_id,
                 "url":               url,
+                "source_url":        url,
+                "domain":            target_domain,
                 "lock_entity":       lock_entity,
                 "confidence_tier":   url_to_tier.get(url, "High"),
                 "sourcing_vector":   sourcing_vector,
@@ -1164,12 +1318,29 @@ def dispatch():
             })
         except Exception as already_err:
             if "already exists" in str(already_err).lower():
-                log.info("dispatch_cross_campaign_dup", domain=target_domain)
-                doc_ref.update({"matched_campaigns": firestore.ArrayUnion([campaign_id])})
+                # Existing lead is the SSOT — never overwrite its status to duplicate.
+                # Only attach this campaign; the *new* URL attempt is the skip_dup.
+                log.info(
+                    "dispatch_cross_campaign_dup",
+                    domain=target_domain,
+                    campaign_id=campaign_id,
+                    note="Identity already exists — skip as duplicate (do not re-promote).",
+                )
+                try:
+                    doc_ref.update({
+                        "matched_campaigns": firestore.ArrayUnion([campaign_id]),
+                        "domain": target_domain,
+                    })
+                except Exception as _dup_upd_err:
+                    log.warning(
+                        "dispatch_dup_campaign_union_failed",
+                        error=str(_dup_upd_err),
+                        lead_id=lead_id[:16],
+                    )
             else:
                 log.warning("dispatch_stub_create_failed", url=url[:80],
                             error=str(already_err))
-            return {"url": url, "status": "skip_dup"}
+            return {"url": url, "status": "skip_dup", "reason": "already_exists"}
 
         try:
             # ── STEP 1: PRISM deep scrape FIRST (P0 FIX — 2026-06-20) ────────────
@@ -1734,6 +1905,7 @@ def dispatch():
                 "id":                           lead_id,
                 "source_url":                   url,
                 "url":                          url,  # V27.2.0 identity SSOT (dedup reads both)
+                "domain":                       target_domain,  # V27.9 campaign domain inventory
                 "tenant_id":                    tenant_id,
                 "origin_engine":                "cartographer",
                 "score":                        score,

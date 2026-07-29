@@ -19,6 +19,7 @@ TERMINAL_NON_LEAD_STATUSES: frozenset[str] = frozenset({
     "failed_scrape",
     "failed_eval",
     "failed_vertex_timeout",
+    "duplicate",  # V27.9: same portal/domain sibling — do not re-queue as fresh
 })
 
 # Statuses that count toward tenant velocity (live inventory)

@@ -204,6 +204,32 @@ def resolve_identity_key(
     return key, meta
 
 
+# V27.9: Thin / policy-noise paths on company & portal sites (not unique buyers).
+# Applied only when host is NOT social/shared multi-thread identity.
+_JUNK_PORTAL_PATH_RE = re.compile(
+    r"(?:"
+    r"/(?:privacy|privacy-policy|terms|terms-of-service|tos|cookie|cookies|"
+    r"login|log-in|signin|sign-in|signup|sign-up|register|wp-admin|wp-login|"
+    r"cart|checkout|basket|wishlist|account|dashboard|"
+    r"tag|tags|category|categories|author|authors|feed|rss|sitemap|"
+    r"search|faq|faqs|help-center|support-center)(?:/|$)|"
+    r"/page/\d+(?:/|$)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def is_junk_portal_path(url: str | None) -> bool:
+    """True for privacy/login/tag/pagination paths that rarely hold buyer intent."""
+    if not url:
+        return False
+    try:
+        path = urlparse(url if "://" in url else f"https://{url}").path or ""
+    except Exception:
+        path = str(url)
+    return bool(_JUNK_PORTAL_PATH_RE.search(path))
+
+
 def multi_entity_host_list() -> tuple[str, ...]:
     """Public read-only view of configured suffixes (for tests / admin)."""
     return MULTI_ENTITY_HOST_SUFFIXES
