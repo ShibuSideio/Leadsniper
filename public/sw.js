@@ -1,4 +1,4 @@
-const CACHE_NAME = 'sideio-v27.8.1'; // V27.8.1: geo Global + All country/region; 3m freshness
+const CACHE_NAME = 'sideio-v27.9.1'; // V27.9.1: hard 90d content freshness feed+dispatch
 const ASSETS_TO_CACHE = [
      '/',
      '/index.html',

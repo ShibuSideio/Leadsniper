@@ -73,6 +73,81 @@ function _isInbound(lead) {
     return type === 'inbound' || ['webhook', 'form', 'typeform', 'inbound'].includes(source);
 }
 
+// V27.9.1: Client-side 90-day content freshness (mirrors shared/content_freshness.py).
+// Hides multi-year Reddit/social inventory that slipped in before server gates.
+const CONTENT_MAX_AGE_DAYS = 90;
+const _REDDIT_ID_MIN_RECENT = '1s00000'; // base36 floor ~90d (mid-2026)
+
+function _redditPostIdFromUrl(url) {
+    const u = (url || '').toLowerCase();
+    let m = u.match(/reddit\.com\/r\/[^/]+\/comments\/([a-z0-9]+)/);
+    if (m) return m[1];
+    m = u.match(/reddit\.com\/comments\/([a-z0-9]+)/);
+    if (m) return m[1];
+    m = u.match(/(?:^|\/\/)redd\.it\/([a-z0-9]+)/);
+    if (m) return m[1];
+    m = u.match(/reddit\.com\/gallery\/([a-z0-9]+)/);
+    if (m) return m[1];
+    return null;
+}
+
+function _b36ToBigInt(s) {
+    const chars = '0123456789abcdefghijklmnopqrstuvwxyz';
+    let n = 0n;
+    for (const c of String(s || '').toLowerCase()) {
+        const i = chars.indexOf(c);
+        if (i < 0) return null;
+        n = n * 36n + BigInt(i);
+    }
+    return n;
+}
+
+function _b36Less(a, b) {
+    try {
+        const A = _b36ToBigInt(a);
+        const B = _b36ToBigInt(b);
+        if (A == null || B == null) return true;
+        return A < B;
+    } catch (_) {
+        return true;
+    }
+}
+
+/**
+ * True if lead content is older than 90 days (must not show in feed).
+ * Prefer server fields content_stale / content_age_days; fall back to Reddit id.
+ */
+function _isContentStaleLead(lead) {
+    if (!lead) return false;
+    if (lead.content_stale === true) return true;
+    if (typeof lead.content_age_days === 'number' && lead.content_age_days > CONTENT_MAX_AGE_DAYS) {
+        return true;
+    }
+    const url = lead.source_url || lead.url || '';
+    const rid = lead.reddit_post_id || _redditPostIdFromUrl(url);
+    if (rid) {
+        if (rid.length <= 5) return true;
+        if (_b36Less(rid, _REDDIT_ID_MIN_RECENT)) return true;
+    }
+    // Quora / social undated with explicit year markers in title/snippet
+    const social = /reddit\.|quora\.|linkedin\.|facebook\.|twitter\.|x\.com/i.test(url);
+    if (social && !rid) {
+        const blob = `${lead.title || ''} ${lead.snippet || ''} ${lead.pain_point || ''}`;
+        const years = [...blob.matchAll(/\b(20\d{2})\b/g)].map(m => parseInt(m[1], 10));
+        if (years.length) {
+            const oldest = Math.min(...years);
+            const nowY = new Date().getUTCFullYear();
+            // Year at least 1 calendar year behind mid-year vs 90d window
+            if (oldest <= nowY - 1) {
+                const mid = Date.UTC(oldest, 6, 1);
+                const ageDays = (Date.now() - mid) / 86400000;
+                if (ageDays > CONTENT_MAX_AGE_DAYS) return true;
+            }
+        }
+    }
+    return false;
+}
+
 // Debounced render — coalesces rapid onSnapshot bursts into one paint.
 let _renderRAF = null;
 function _scheduleRender() {
@@ -1217,6 +1292,11 @@ async function loadLeads() {
                     let data = doc.data();
                     data.id = doc.id;
                     if ((data.status || 'new') !== 'new') return;
+                    // V27.9.1: never show multi-year social/content-stale inventory
+                    if (_isContentStaleLead(data)) {
+                        if (window.SIO_DEBUG) console.log('[Freshness] Hidden stale lead', data.id, data.url || data.source_url);
+                        return;
+                    }
                     rawLeadsCache.push(data);
                     _leadsMap.set(doc.id, data);  // O(1) lookup for observer
                     // V23.9: Raw data shape logger — traces ALL leads for Radar debugging
@@ -1310,6 +1390,7 @@ function renderLeads() {
 
     const filteredLeads = baseData.filter(lead => {
         if ((lead.status || 'new') !== 'new') return false;
+        if (_isContentStaleLead(lead)) return false;
         if (currentCampaignFilter !== 'all') {
             const matched = Array.isArray(lead.matched_campaigns)
                 ? lead.matched_campaigns.includes(currentCampaignFilter)

@@ -1185,6 +1185,48 @@ def dispatch():
                      note="Could not extract root domain from URL.")
             return {"url": url, "status": "skip_no_domain"}
 
+        # V27.9.1: Hard content-age gate (90d) — last line of defence if produce
+        # or queue still holds multi-year Reddit/social URLs.
+        try:
+            from shared.content_freshness import (  # type: ignore[import]
+                is_stale_url,
+                freshness_fields_for_url,
+            )
+            _snip_meta = snippet_map.get(url) if isinstance(snippet_map, dict) else None
+            _snip_text = ""
+            if isinstance(_snip_meta, dict):
+                _snip_text = str(_snip_meta.get("text") or "")
+            elif isinstance(_snip_meta, str):
+                _snip_text = _snip_meta
+            _stale, _stale_reason = is_stale_url(
+                url,
+                title=_snip_text[:200],
+                snippet=_snip_text[:400],
+            )
+            if _stale:
+                log.info(
+                    "dispatch_skip_stale_content",
+                    url=url[:100],
+                    domain=target_domain,
+                    reason=_stale_reason,
+                    note="V27.9.1: content older than 90d — skip before PRISM/score.",
+                )
+                return {
+                    "url": url,
+                    "status": "skip_stale_content",
+                    "reason": _stale_reason,
+                }
+        except Exception as _fresh_err:
+            log.warning(
+                "dispatch_freshness_check_failed",
+                error=str(_fresh_err),
+                url=url[:80],
+                note="Fail-closed for known social hosts only.",
+            )
+            _u_low = (url or "").lower()
+            if any(h in _u_low for h in ("reddit.", "quora.", "redd.it")):
+                return {"url": url, "status": "skip_stale_content", "reason": "freshness_module_error"}
+
         # V24.5.7: Pre-PRISM TLD gate. Non-business TLD domains (academic, government,
         # personal blog) were previously gated only inside deep_context_serper_dork()
         # AFTER PRISM already ran (costing 3-5 credits per URL). This gate fires before PRISM
@@ -1901,11 +1943,19 @@ def dispatch():
 
             log.info("TRACE-10: Writing qualified lead to Firestore.",
                      url=url[:80], score=score, campaign_id=campaign_id)
+            _fresh_meta: dict = {}
+            try:
+                from shared.content_freshness import freshness_fields_for_url  # type: ignore[import]
+                _fresh_meta = freshness_fields_for_url(url)
+            except Exception:
+                _fresh_meta = {}
+
             lead_payload = {
                 "id":                           lead_id,
                 "source_url":                   url,
                 "url":                          url,  # V27.2.0 identity SSOT (dedup reads both)
                 "domain":                       target_domain,  # V27.9 campaign domain inventory
+                **_fresh_meta,
                 "tenant_id":                    tenant_id,
                 "origin_engine":                "cartographer",
                 "score":                        score,
