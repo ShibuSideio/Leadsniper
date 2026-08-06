@@ -1653,6 +1653,40 @@ def dispatch():
 
             score = evaluation.get("score", 0)
 
+            # V26.8.0: Universal peer-seller / directory-shell gate (no domain hardcodes).
+            try:
+                from services.peer_seller_gate import apply_peer_seller_gate  # type: ignore[import]
+                evaluation = apply_peer_seller_gate(
+                    evaluation,
+                    campaign=campaign,
+                    url=url,
+                    text=text,
+                    primary_strategy=_primary_strategy or "",
+                )
+                score = int(evaluation.get("score", score) or score)
+                if evaluation.get("peer_seller_blocked"):
+                    log.info(
+                        "dispatch_peer_seller_gate_blocked",
+                        url=url[:80],
+                        score=score,
+                        score_before=evaluation.get("score_before_peer_gate"),
+                        block_reason=(evaluation.get("peer_seller_gate") or {}).get("block_reason"),
+                        directory_shell=bool(evaluation.get("directory_shell_blocked")),
+                        classification=(
+                            (evaluation.get("peer_seller_gate") or {})
+                            .get("classification", {})
+                            .get("role")
+                        ),
+                        note="Peer seller or directory shell - score capped; promotion blocked.",
+                    )
+            except Exception as _peer_err:
+                log.warning(
+                    "dispatch_peer_seller_gate_failed",
+                    error=str(_peer_err),
+                    url=url[:80],
+                    note="Fail-open: continuing without peer gate this URL.",
+                )
+
             # V24.6.0: Page-type score cap — structural URL signals that
             # unambiguously identify non-buyer page categories regardless of
             # what Gemini scores. Prevents conference pages, government portals,
@@ -1759,6 +1793,23 @@ def dispatch():
                 is_thin_payload=is_thin_payload,
                 adapted_evaluation=_adapted_eval,
             )
+            # Peer-seller hard stop: never promote even if hybrid floor would fire.
+            if evaluation.get("peer_seller_blocked") and confidence_bundle.get("promotion"):
+                confidence_bundle = dict(confidence_bundle)
+                confidence_bundle["promotion"] = False
+                confidence_bundle["promotion_path"] = "peer_seller_blocked"
+                confidence_bundle["hybrid_promotion_triggered"] = False
+                confidence_bundle["reason"] = (
+                    f"peer-seller-gate:"
+                    f"{(evaluation.get('peer_seller_gate') or {}).get('block_reason') or 'blocked'}"
+                )
+                log.info(
+                    "dispatch_peer_seller_promotion_blocked",
+                    url=url[:80],
+                    score=score,
+                    confidence=confidence_bundle.get("confidence_score"),
+                    block_reason=(evaluation.get("peer_seller_gate") or {}).get("block_reason"),
+                )
             if confidence_bundle.get("hybrid_promotion_triggered"):
                 log.info(
                     "dispatch_hybrid_promotion_triggered",
@@ -2850,27 +2901,37 @@ def _extract_entities_from_dom(
         if strategy == "PLATFORM_MINING":
             prompt += (
                 f"\nPLATFORM TARGETS: {', '.join(platform_targets[:5])}\n"
-                "This is a DIRECTORY/LISTING page. Extract every agent, vendor, or "
-                "business profile visible. Include their contact info if shown.\n"
-                "Each extracted entity is a potential lead to contact.\n"
+                "This is a DIRECTORY/LISTING page. Extract entities that are BUYERS or "
+                "channel targets of the campaign owner's product — NOT peer businesses "
+                "that sell the same service as the owner.\n"
+                "Example: if the owner IS an education consultancy, do NOT extract other "
+                "education consultancies from Justdial; if the owner sells tools TO agents, "
+                "DO extract agents.\n"
+                "Include contact info when shown. Prefer demand-side entities.\n"
             )
         elif strategy == "COMPETITOR_TOUCHPOINT":
             prompt += (
                 f"\nCOMPETITOR NAMES: {', '.join(competitor_names[:5])}\n"
                 "This is a REVIEW/ENGAGEMENT page. Extract:\n"
-                "- Reviewers who left reviews (they may need the same service)\n"
-                "- Businesses that responded to reviews (competitors to study)\n"
-                "- People who commented or engaged publicly\n"
+                "- Reviewers who left reviews (they may need the same service) — PRIMARY leads\n"
+                "- People who commented or engaged publicly with demand language\n"
+                "Do NOT extract peer sellers of the campaign owner's offering as leads.\n"
                 "The REVIEWER is the lead — they have an active need.\n"
             )
+
+        try:
+            from services.peer_seller_gate import peer_seller_prompt_block  # type: ignore[import]
+            prompt += peer_seller_prompt_block()
+        except Exception:
+            pass
 
         prompt += (
             f"\n\nWEBPAGE CONTENT (first 8000 chars):\n{text[:8000]}\n\n"
             "RULES:\n"
             "- Extract REAL entities only — no generic placeholders\n"
             "- Include contact info (phone, email, profile URL) when visible\n"
-            "- Score each entity 0-100 based on ICP relevance\n"
-            "- Skip entities that are clearly bots, spam, or irrelevant\n"
+            "- Score each entity 0-100 based on BUYER/ICP relevance (not category keyword match)\n"
+            "- Skip bots, spam, and PEER SELLERS of the same service as TARGET ICP owner\n"
             "- Maximum 15 entities per page\n"
         )
 
@@ -2891,6 +2952,31 @@ def _extract_entities_from_dom(
             e for e in entities
             if isinstance(e, dict) and e.get("relevance_score", 0) >= 30
         ]
+
+        # Deterministic peer-seller strip (domain-agnostic)
+        try:
+            from services.peer_seller_gate import filter_peer_seller_entities  # type: ignore[import]
+            qualified, _peer_rejected = filter_peer_seller_entities(
+                qualified,
+                campaign=campaign,
+                source_url=source_url,
+                page_text=text,
+                primary_strategy=str(strategy or ""),
+            )
+            if _peer_rejected:
+                log.info(
+                    "entity_extraction_peer_sellers_removed",
+                    url=source_url[:80],
+                    removed=len(_peer_rejected),
+                    kept=len(qualified),
+                    samples=[str(e.get("name") or "")[:40] for e in _peer_rejected[:5]],
+                )
+        except Exception as _peer_ent_err:
+            log.warning(
+                "entity_extraction_peer_filter_failed",
+                error=str(_peer_ent_err),
+                url=source_url[:80],
+            )
 
         log.info("entity_extraction_complete",
                  url=source_url[:80],

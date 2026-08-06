@@ -416,12 +416,21 @@ def _scoring_intent_rules(sourcing_vector: str, primary_strategy: str, domain_fa
     family = (domain_family or "").strip().lower()
     is_consumer = vector in _CONSUMER_VECTORS
 
-    # Always-on competitor exclusion (narrow — outbound lead-gen tools only).
+    try:
+        from services.peer_seller_gate import peer_seller_prompt_block  # type: ignore[import]
+        peer_block = peer_seller_prompt_block()
+    except Exception:
+        peer_block = (
+            "\nPEER SELLER EXCLUSION: Businesses that sell the same service as USER BIO "
+            "are competitors — score 0–2. Buyers of that service score normally.\n"
+        )
+
+    # Tool/lead-gen competitor exclusion + universal peer-seller rule.
     seller = (
-        "SELLER EXCLUSION RULE: If the target sells B2B lead generation, cold email "
+        "LEAD-GEN TOOL EXCLUSION: If the target sells B2B lead generation, cold email "
         "marketing, B2B contact databases/data scraping, or outbound sales-agency "
-        "services as their core product, score 0 (or <4). Do NOT exclude legitimate "
-        "ICP businesses that merely market their own product/service."
+        "tools as their core product, score 0 (or <4).\n"
+        f"{peer_block}"
     )
 
     if strategy == "PLATFORM_MINING":
@@ -429,13 +438,13 @@ def _scoring_intent_rules(sourcing_vector: str, primary_strategy: str, domain_fa
             f"{seller}\n\n"
             "PLATFORM_MINING FIT RULE (overrides generic B2B service-page penalties):\n"
             "This campaign mines listing/directory/aggregator platforms for ICP entities "
-            "(agents, brokers, clinics, vendors, local businesses). Public profile pages, "
-            "active listings, and directory entries WITH identity/contact footprint are "
-            "VALID leads even without explicit buyer pain language. Score 6–9 when the "
-            "entity matches the ICP and geo; score ≤3 only for spam, wrong geo, or "
-            "direct competitors selling the same service as the campaign owner.\n"
-            "Do NOT apply the old 'public services page = GENERAL_FIT ≤3' penalty to "
-            "listing profiles under PLATFORM_MINING."
+            "that would BUY from the campaign owner (or match the stated buyer/channel ICP). "
+            "Public profile pages and listings WITH identity/contact footprint can score 6–9 "
+            "when the entity is a buyer/channel target — NOT when they are peer sellers of "
+            "the owner's own offering (e.g. other consultancies when we ARE a consultancy).\n"
+            "Directory category SERPs ('Popular X in City') listing same-service peers → score ≤2.\n"
+            "Do NOT apply the old 'public services page = GENERAL_FIT ≤3' penalty to true "
+            "ICP channel targets under PLATFORM_MINING."
         )
 
     if strategy == "COMPETITOR_TOUCHPOINT":
@@ -848,12 +857,13 @@ def _domain_prefilter_guidance(mode: dict[str, Any] | None) -> str:
             "Do NOT auto-classify directories (Yelp, JustDial, IndiaMART, Clutch), review sites",
             "(G2, Capterra, Trustpilot, Google reviews), classified portals (Bayut, Property Finder,",
             "Dubizzle, OLX), or aggregator profile/listing pages as Low solely because they are",
-            "directories. For this domain they are often valuable signal sources.",
-            "- Relevant local/industry listing or review pages → Medium (default)",
-            "- Snippet shows clear buyer/client pain, active listing intent, or a matching ICP entity → High",
-            "- Still Low if purely promotional vendor homepage selling the same service as USER BIO",
+            "directories — WHEN the entity is a buyer or channel target for USER BIO.",
+            "- Matching ICP channel target (e.g. agent when we sell tools TO agents) → Medium/High",
+            "- Snippet shows clear buyer/client pain or active demand → High",
+            "- PEER SELLERS of the same service as USER BIO on that directory → Low (always)",
+            "- Category SERP shells listing many same-service peers → Low",
             "",
-        ])
+        )
     if mode.get("permissive_ambiguous"):
         parts.extend([
             "LOW-LIQUIDITY / SPARSE-MARKET MODE:",
@@ -987,7 +997,11 @@ Low Confidence: SEO-optimised listicles, "Top 10" posts, how-to guides, {low_dir
 # STEP 2 — UNIVERSAL RULES
 SOCIAL PLATFORM RULE: Evaluate the SPECIFIC POST intent, not the platform's general purpose.
 GEO RULE: Wrong region → Low.
-COMPETITOR RULE: If the snippet belongs to a vendor SELLING the same service as the USER BIO, classify it as Low.
+COMPETITOR / PEER SELLER RULE: If the snippet is a business that SELLS the same product/service
+as USER BIO (peer on Justdial/Yelp/directory category pages), classify as Low — never High
+just because the directory category keywords match the bio. Buyers of that service stay High/Medium.
+DIRECTORY SHELL RULE: Category SERPs ('Popular X in City', nct- listing indexes) without a
+single buyer entity → Low.
 {few_shot}
 # STEP 3 — BUYER FORUM EXCEPTION
 Do NOT classify as Low merely because a URL domain is marketing- or community-related.
